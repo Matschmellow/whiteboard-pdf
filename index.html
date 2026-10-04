@@ -6,6 +6,7 @@
 <title>Whiteboard → PDF</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/svg2pdf.js/2.2.4/svg2pdf.umd.min.js"></script>
 <style>
 :root{--bg:#f4f5f7;--card:#fff;--tx:#1b1d21;--mut:#6b7280;--ac:#2563eb;--bd:#d9dce1}
 @media (prefers-color-scheme:dark){:root{--bg:#141517;--card:#1f2124;--tx:#eceef1;--mut:#9aa0a8;--ac:#5b8cff;--bd:#33373d}}
@@ -36,8 +37,8 @@ a.btn{background:var(--ac);color:#fff;text-decoration:none;padding:8px 14px;bord
   <div class="card row">
     <div><label for="bg">Hintergrund</label>
       <select id="bg"><option value="dark">Dunkel (wie Original)</option><option value="light">Hell (zum Drucken)</option></select></div>
-    <div><label for="res">Auflösung</label>
-      <select id="res"><option value="2">Hoch (2×)</option><option value="3" selected>Sehr hoch (3×)</option><option value="4">Maximal (4×)</option></select></div>
+    <div><label for="res">Qualität</label>
+      <select id="res"><option value="vector" selected>Vektor (unbegrenzt scharf)</option><option value="3">Bild 3×</option><option value="4">Bild 4× (max.)</option></select></div>
   </div>
 
   <div class="card" id="drop">
@@ -79,7 +80,7 @@ async function handle(files) {
       info.remove();
       const wrap = document.createElement("span");
       wrap.innerHTML = "<small></small>";
-      wrap.firstChild.textContent = `${r.w}×${r.h} px · ${(r.blob.size/1048576).toFixed(1)} MB`;
+      wrap.firstChild.textContent = `${r.info} · ${(r.blob.size/1048576).toFixed(1)} MB`;
       item.appendChild(wrap);
       const a = document.createElement("a");
       a.className = "btn"; a.textContent = "PDF laden";
@@ -137,11 +138,31 @@ async function convert(f, status) {
   rect.setAttribute("fill", light ? "#ffffff" : "#1f1f1f");
   root.insertBefore(rect, layer);
 
-  let svg = new XMLSerializer().serializeToString(root);
-  if (light) svg = svg.replace(/rgba\(235,\s*235,\s*235,/g, "rgba(25,25,25,").replace(/rgba\(31,\s*31,\s*31,/g, "rgba(255,255,255,");
+  if (light) root.querySelectorAll("[fill]").forEach(e => e.setAttribute("fill",
+    e.getAttribute("fill").replace(/rgba\(235,\s*235,\s*235,/, "rgba(25,25,25,").replace(/rgba\(31,\s*31,\s*31,/, "rgba(255,255,255,")));
+
+  const { jsPDF } = window.jspdf;
+  const mk = () => new jsPDF({ orientation: W >= H ? "l" : "p", unit: "px", format: [W, H], compress: true });
+
+  if ($("res").value === "vector") {
+    status("Vektor-PDF wird erstellt …");
+    try {
+      const pdf = mk();
+      root.setAttribute("style", "position:absolute;left:-99999px;top:0");
+      document.body.appendChild(root);
+      await pdf.svg(root, { x: 0, y: 0, width: W, height: H });
+      root.remove();
+      return { blob: pdf.output("blob"), info: "Vektor" };
+    } catch (e) {
+      root.remove(); console.warn(e);
+      status("Vektor fehlgeschlagen, nutze Bild …");
+    }
+  }
 
   status("Bild wird in hoher Auflösung gerendert …");
-  const scale = Math.min(+$("res").value, Math.sqrt(MAX_PIXELS / (W * H)));
+  const svg = new XMLSerializer().serializeToString(root);
+  const res = $("res").value === "vector" ? 3 : +$("res").value;
+  const scale = Math.min(res, Math.sqrt(MAX_PIXELS / (W * H)));
   const cw = Math.round(W * scale), ch = Math.round(H * scale);
   const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
   const img = new Image();
@@ -149,15 +170,12 @@ async function convert(f, status) {
   await img.decode();
   const c = document.createElement("canvas");
   c.width = cw; c.height = ch;
-  const ctx = c.getContext("2d");
-  ctx.drawImage(img, 0, 0, cw, ch);
+  c.getContext("2d").drawImage(img, 0, 0, cw, ch);
   URL.revokeObjectURL(url);
 
-  status("PDF wird erstellt …");
-  const { jsPDF } = window.jspdf;
-  const pdf = new jsPDF({ orientation: W >= H ? "l" : "p", unit: "px", format: [W, H], compress: true });
+  const pdf = mk();
   pdf.addImage(c.toDataURL("image/png"), "PNG", 0, 0, W, H, undefined, "FAST");
-  return { blob: pdf.output("blob"), w: cw, h: ch };
+  return { blob: pdf.output("blob"), info: `Bild ${cw}×${ch} px` };
 }
 </script>
 </body>
