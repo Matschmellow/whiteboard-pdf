@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Whiteboard → PDF</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--tx:#1b1d21;--mut:#6b7280;--ac:#2563eb;--bd:#d9dce1}
+@media (prefers-color-scheme:dark){:root{--bg:#141517;--card:#1f2124;--tx:#eceef1;--mut:#9aa0a8;--ac:#5b8cff;--bd:#33373d}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.5 -apple-system,system-ui,"Segoe UI",Roboto,sans-serif;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom)}
+main{max-width:640px;margin:0 auto;padding:28px 0}
+h1{font-size:1.6rem;margin:0 0 4px}
+p.s{color:var(--mut);margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:18px;margin-bottom:16px}
+#drop{border:2px dashed var(--bd);text-align:center;padding:36px 16px;cursor:pointer}
+#drop.over{border-color:var(--ac)}
+label{display:block;font-weight:600;margin:0 0 6px}
+select{width:100%;padding:10px;border-radius:10px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);font:inherit}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.item{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 0;border-top:1px solid var(--bd)}
+.item:first-child{border-top:0}
+.item span{overflow-wrap:anywhere}
+.item small{color:var(--mut);display:block}
+a.btn{background:var(--ac);color:#fff;text-decoration:none;padding:8px 14px;border-radius:10px;font-weight:600;white-space:nowrap}
+.err{color:#dc2626}
+</style>
+</head>
+<body>
+<main>
+  <h1>Whiteboard → PDF</h1>
+  <p class="s">ZIP-Export des Whiteboards auswählen, daraus wird ein hochaufgelöstes PDF. Alles läuft lokal in deinem Browser, nichts wird hochgeladen.</p>
+
+  <div class="card row">
+    <div><label for="bg">Hintergrund</label>
+      <select id="bg"><option value="dark">Dunkel (wie Original)</option><option value="light">Hell (zum Drucken)</option></select></div>
+    <div><label for="res">Auflösung</label>
+      <select id="res"><option value="2">Hoch (2×)</option><option value="3" selected>Sehr hoch (3×)</option><option value="4">Maximal (4×)</option></select></div>
+  </div>
+
+  <div class="card" id="drop">
+    <strong>ZIP-Dateien hier ablegen</strong><br><span style="color:var(--mut)">oder tippen zum Auswählen (mehrere möglich)</span>
+    <input id="file" type="file" accept=".zip,application/zip" multiple hidden>
+  </div>
+
+  <div class="card" id="out" hidden></div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const NS = "http://www.w3.org/2000/svg";
+const MAX_PIXELS = 14e6; // bleibt unter dem Canvas-Limit von iOS/Safari
+
+const drop = $("drop"), file = $("file"), out = $("out");
+drop.onclick = () => file.click();
+file.onchange = () => handle([...file.files]);
+["dragover","dragenter"].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add("over"); }));
+["dragleave","drop"].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", ev => handle([...ev.dataTransfer.files]));
+
+function row(name) {
+  out.hidden = false;
+  const d = document.createElement("div");
+  d.className = "item";
+  d.innerHTML = "<span></span><small>Wird verarbeitet …</small>";
+  d.firstChild.textContent = name;
+  out.appendChild(d);
+  return d;
+}
+
+async function handle(files) {
+  for (const f of files) {
+    const item = row(f.name);
+    const info = item.querySelector("small");
+    try {
+      const r = await convert(f, t => info.textContent = t);
+      info.remove();
+      const wrap = document.createElement("span");
+      wrap.innerHTML = "<small></small>";
+      wrap.firstChild.textContent = `${r.w}×${r.h} px · ${(r.blob.size/1048576).toFixed(1)} MB`;
+      item.appendChild(wrap);
+      const a = document.createElement("a");
+      a.className = "btn"; a.textContent = "PDF laden";
+      a.href = URL.createObjectURL(r.blob);
+      a.download = f.name.replace(/\.zip$/i, "") + ".pdf";
+      item.appendChild(a);
+    } catch (e) {
+      info.className = "err";
+      info.textContent = "Fehler: " + e.message;
+    }
+  }
+  file.value = "";
+}
+
+async function convert(f, status) {
+  status("ZIP wird entpackt …");
+  const zip = await JSZip.loadAsync(f);
+  const entry = Object.values(zip.files).find(z => !z.dir && /\.html?$/i.test(z.name));
+  if (!entry) throw new Error("Keine HTML-Datei in der ZIP gefunden.");
+  const doc = new DOMParser().parseFromString(await entry.async("string"), "text/html");
+
+  status("Striche werden gesammelt …");
+  const root = document.createElementNS(NS, "svg");
+  root.setAttribute("style", "position:absolute;left:-99999px;top:0;width:10px;height:10px");
+  const layer = document.createElementNS(NS, "g");
+  root.appendChild(layer);
+  document.body.appendChild(root);
+
+  let n = 0;
+  doc.querySelectorAll(".anchor").forEach(a => {
+    const ink = a.querySelector("svg.ink");
+    if (!ink) return;
+    const x = parseFloat(a.style.left) || 0, y = parseFloat(a.style.top) || 0;
+    const m = (a.style.transform.match(/matrix\(([^)]+)\)/) || [])[1];
+    const g = document.createElementNS(NS, "g");
+    g.setAttribute("transform", `translate(${x} ${y})` + (m ? ` matrix(${m})` : ""));
+    const s = document.importNode(ink, true);
+    s.querySelectorAll(".inkHitTestOverlay").forEach(o => o.remove());
+    s.removeAttribute("class"); s.removeAttribute("tabindex");
+    s.setAttribute("overflow", "visible");
+    g.appendChild(s); layer.appendChild(g); n++;
+  });
+  if (!n) { root.remove(); throw new Error("Keine Handschrift im Whiteboard gefunden."); }
+
+  const b = layer.getBBox(), pad = 40;
+  root.remove();
+  const W = Math.ceil(b.width + 2*pad), H = Math.ceil(b.height + 2*pad);
+  const light = $("bg").value === "light";
+  root.setAttribute("viewBox", `${b.x-pad} ${b.y-pad} ${W} ${H}`);
+  root.setAttribute("width", W); root.setAttribute("height", H);
+  root.removeAttribute("style");
+  const rect = document.createElementNS(NS, "rect");
+  rect.setAttribute("x", b.x-pad); rect.setAttribute("y", b.y-pad);
+  rect.setAttribute("width", W); rect.setAttribute("height", H);
+  rect.setAttribute("fill", light ? "#ffffff" : "#1f1f1f");
+  root.insertBefore(rect, layer);
+
+  let svg = new XMLSerializer().serializeToString(root);
+  if (light) svg = svg.replace(/rgba\(235,\s*235,\s*235,/g, "rgba(25,25,25,").replace(/rgba\(31,\s*31,\s*31,/g, "rgba(255,255,255,");
+
+  status("Bild wird in hoher Auflösung gerendert …");
+  const scale = Math.min(+$("res").value, Math.sqrt(MAX_PIXELS / (W * H)));
+  const cw = Math.round(W * scale), ch = Math.round(H * scale);
+  const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
+  const img = new Image();
+  img.src = url;
+  await img.decode();
+  const c = document.createElement("canvas");
+  c.width = cw; c.height = ch;
+  const ctx = c.getContext("2d");
+  ctx.drawImage(img, 0, 0, cw, ch);
+  URL.revokeObjectURL(url);
+
+  status("PDF wird erstellt …");
+  const { jsPDF } = window.jspdf;
+  const pdf = new jsPDF({ orientation: W >= H ? "l" : "p", unit: "px", format: [W, H], compress: true });
+  pdf.addImage(c.toDataURL("image/png"), "PNG", 0, 0, W, H, undefined, "FAST");
+  return { blob: pdf.output("blob"), w: cw, h: ch };
+}
+</script>
+</body>
+</html>
