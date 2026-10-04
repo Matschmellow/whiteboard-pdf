@@ -4,9 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Whiteboard → PDF</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/svg2pdf.js/2.2.4/svg2pdf.umd.min.js"></script>
 <style>
 :root{--bg:#f4f5f7;--card:#fff;--tx:#1b1d21;--mut:#6b7280;--ac:#2563eb;--bd:#d9dce1}
 @media (prefers-color-scheme:dark){:root{--bg:#141517;--card:#1f2124;--tx:#eceef1;--mut:#9aa0a8;--ac:#5b8cff;--bd:#33373d}}
@@ -54,6 +51,35 @@ const $ = id => document.getElementById(id);
 const NS = "http://www.w3.org/2000/svg";
 const MAX_PIXELS = 14e6; // bleibt unter dem Canvas-Limit von iOS/Safari
 
+
+const LIBS = [
+  ["JSZip", () => window.JSZip, ["https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js", "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"]],
+  ["jsPDF", () => window.jspdf, ["https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js", "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"]],
+  ["svg2pdf", () => window.jspdf && window.jspdf.jsPDF.API.svg, ["https://cdn.jsdelivr.net/npm/svg2pdf.js@2.2.4/dist/svg2pdf.umd.min.js", "https://unpkg.com/svg2pdf.js@2.2.4/dist/svg2pdf.umd.min.js"]]
+];
+function loadScript(u) {
+  return new Promise((ok, no) => {
+    const e = document.createElement("script");
+    e.src = u; e.onload = ok; e.onerror = () => no(new Error(u));
+    document.head.appendChild(e);
+  });
+}
+let ready;
+function loadLibs() {
+  return ready || (ready = (async () => {
+    const missing = [];
+    for (const [name, check, urls] of LIBS) {
+      for (const u of urls) {
+        if (check()) break;
+        try { await loadScript(u); } catch (e) {}
+      }
+      if (!check()) missing.push(name);
+    }
+    return missing;
+  })());
+}
+loadLibs();
+
 const drop = $("drop"), file = $("file"), out = $("out");
 drop.onclick = () => file.click();
 file.onchange = () => handle([...file.files]);
@@ -76,7 +102,11 @@ async function handle(files) {
     const item = row(f.name);
     const info = item.querySelector("small");
     try {
-      const r = await convert(f, t => info.textContent = t);
+      info.textContent = "Bibliotheken werden geladen …";
+      const miss = await loadLibs();
+      if (miss.includes("JSZip") || miss.includes("jsPDF"))
+        throw new Error("Bibliothek " + miss.join(", ") + " konnte nicht geladen werden. Internetverbindung prüfen und Seite neu laden.");
+      const r = await convert(f, t => info.textContent = t, miss);
       info.remove();
       const wrap = document.createElement("span");
       wrap.innerHTML = "<small></small>";
@@ -95,7 +125,7 @@ async function handle(files) {
   file.value = "";
 }
 
-async function convert(f, status) {
+async function convert(f, status, miss = []) {
   status("ZIP wird entpackt …");
   const zip = await JSZip.loadAsync(f);
   const entry = Object.values(zip.files).find(z => !z.dir && /\.html?$/i.test(z.name));
@@ -144,13 +174,13 @@ async function convert(f, status) {
   const { jsPDF } = window.jspdf;
   const mk = () => new jsPDF({ orientation: W >= H ? "l" : "p", unit: "px", format: [W, H], compress: true });
 
-  if ($("res").value === "vector") {
+  if ($("res").value === "vector" && !miss.includes("svg2pdf")) {
     status("Vektor-PDF wird erstellt …");
     try {
       const pdf = mk();
       root.setAttribute("style", "position:absolute;left:-99999px;top:0");
       document.body.appendChild(root);
-      await pdf.svg(root, { x: 0, y: 0, width: W, height: H });
+      await Promise.race([pdf.svg(root, { x: 0, y: 0, width: W, height: H }), new Promise((_, no) => setTimeout(() => no(new Error("Zeitüberschreitung")), 90000))]);
       root.remove();
       return { blob: pdf.output("blob"), info: "Vektor" };
     } catch (e) {
