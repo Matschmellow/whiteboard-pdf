@@ -49,7 +49,9 @@ a.btn{background:var(--ac);color:#fff;text-decoration:none;padding:8px 14px;bord
 <script>
 const $ = id => document.getElementById(id);
 const NS = "http://www.w3.org/2000/svg";
+const XLINK = "http://www.w3.org/1999/xlink";
 const MAX_PIXELS = 14e6; // bleibt unter dem Canvas-Limit von iOS/Safari
+const MAX_IMG = 4096;    // max. Kantenlänge eingebetteter Bilder
 
 
 const LIBS = [
@@ -125,6 +127,73 @@ async function handle(files) {
   file.value = "";
 }
 
+/* ---------- Bilder ---------- */
+
+// Pfad aus der ZIP auflösen (relativ zur HTML-Datei, URL-kodiert, Groß/Klein egal)
+function findEntry(zip, basePath, src) {
+  let s = src.split(/[?#]/)[0].replace(/\\/g, "/");
+  try { s = decodeURIComponent(s); } catch (e) {}
+  const dir = basePath.includes("/") ? basePath.slice(0, basePath.lastIndexOf("/") + 1) : "";
+  const parts = [];
+  for (const p of (s.startsWith("/") ? s.slice(1) : dir + s).split("/")) {
+    if (p === "..") parts.pop(); else if (p && p !== ".") parts.push(p);
+  }
+  const path = parts.join("/");
+  let e = zip.file(path) || zip.file(s.replace(/^\.?\//, ""));
+  if (e) return e;
+  const low = path.toLowerCase(), bn = low.split("/").pop();
+  return Object.values(zip.files).find(z => !z.dir && z.name.toLowerCase() === low)
+      || Object.values(zip.files).find(z => !z.dir && z.name.toLowerCase().split("/").pop() === bn) || null;
+}
+
+function sniffMime(b64, name) {
+  if (b64.startsWith("iVBOR")) return "image/png";
+  if (b64.startsWith("/9j/")) return "image/jpeg";
+  if (b64.startsWith("R0lGO")) return "image/gif";
+  if (b64.startsWith("UklGR")) return "image/webp";
+  if (b64.startsWith("PHN2Z") || b64.startsWith("PD94b")) return "image/svg+xml";
+  const ext = (name.match(/\.(\w+)$/) || [])[1];
+  return { jpg: "image/jpeg", jpeg: "image/jpeg", svg: "image/svg+xml" }[(ext || "").toLowerCase()] || "image/" + (ext || "png").toLowerCase();
+}
+
+// liefert { uri, w, h } (PNG/JPEG per Canvas, damit jsPDF/svg2pdf es sicher einbetten kann)
+async function loadImage(src, zip, basePath) {
+  let uri;
+  if (/^data:/i.test(src)) uri = src;
+  else if (/^(https?:)?\/\//i.test(src)) {
+    const blob = await (await fetch(src)).blob();
+    uri = await new Promise((ok, no) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = no; r.readAsDataURL(blob); });
+  } else {
+    const e = findEntry(zip, basePath, src);
+    if (!e) return null;
+    const b64 = await e.async("base64");
+    uri = `data:${sniffMime(b64, e.name)};base64,${b64}`;
+  }
+  const im = new Image();
+  im.src = uri;
+  await im.decode();
+  let w = im.naturalWidth || 1024, h = im.naturalHeight || 1024;
+  const k = Math.min(1, MAX_IMG / Math.max(w, h));
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(w * k)); c.height = Math.max(1, Math.round(h * k));
+  const jpeg = /^data:image\/jpe?g/i.test(uri);
+  const ctx = c.getContext("2d");
+  if (jpeg) { ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height); }
+  ctx.drawImage(im, 0, 0, c.width, c.height);
+  return { uri: jpeg ? c.toDataURL("image/jpeg", 0.92) : c.toDataURL("image/png"), w, h };
+}
+
+function cssUrl(el) {
+  const m = (el.style.backgroundImage || "").match(/url\((['"]?)(.*?)\1\)/);
+  return m ? m[2] : null;
+}
+function px(v, base) {
+  if (!v) return 0;
+  const n = parseFloat(v);
+  if (!n) return 0;
+  return String(v).trim().endsWith("%") ? (base ? n / 100 * base : 0) : n;
+}
+
 async function convert(f, status, miss = []) {
   status("ZIP wird entpackt …");
   const zip = await JSZip.loadAsync(f);
@@ -132,28 +201,72 @@ async function convert(f, status, miss = []) {
   if (!entry) throw new Error("Keine HTML-Datei in der ZIP gefunden.");
   const doc = new DOMParser().parseFromString(await entry.async("string"), "text/html");
 
-  status("Striche werden gesammelt …");
+  status("Striche und Bilder werden gesammelt …");
   const root = document.createElementNS(NS, "svg");
   root.setAttribute("style", "position:absolute;left:-99999px;top:0;width:10px;height:10px");
   const layer = document.createElementNS(NS, "g");
   root.appendChild(layer);
   document.body.appendChild(root);
 
-  let n = 0;
-  doc.querySelectorAll(".anchor").forEach(a => {
-    const ink = a.querySelector("svg.ink");
-    if (!ink) return;
+  let n = 0, nImg = 0, bad = 0;
+  for (const a of doc.querySelectorAll(".anchor, img")) {
+    const isImg = a.tagName === "IMG";
+    if (isImg && a.closest(".anchor")) continue; // wird über den Anchor erfasst
+
     const x = parseFloat(a.style.left) || 0, y = parseFloat(a.style.top) || 0;
     const m = (a.style.transform.match(/matrix\(([^)]+)\)/) || [])[1];
     const g = document.createElementNS(NS, "g");
     g.setAttribute("transform", `translate(${x} ${y})` + (m ? ` matrix(${m})` : ""));
-    const s = document.importNode(ink, true);
-    s.querySelectorAll(".inkHitTestOverlay").forEach(o => o.remove());
-    s.removeAttribute("class"); s.removeAttribute("tabindex");
-    s.setAttribute("overflow", "visible");
-    g.appendChild(s); layer.appendChild(g); n++;
-  });
-  if (!n) { root.remove(); throw new Error("Keine Handschrift im Whiteboard gefunden."); }
+    let used = false;
+
+    // Bilder (zuerst, damit Handschrift darüber liegt)
+    const aw = px(a.style.width, 0) || parseFloat(a.getAttribute("width")) || 0;
+    const ah = px(a.style.height, 0) || parseFloat(a.getAttribute("height")) || 0;
+    const items = [];
+    if (isImg) items.push(a);
+    else {
+      a.querySelectorAll("img").forEach(i => items.push(i));
+      if (cssUrl(a)) items.push(a);
+    }
+    for (const el of items) {
+      const src = el.tagName === "IMG" ? (el.getAttribute("src") || el.getAttribute("data-src")) : cssUrl(el);
+      if (!src) continue;
+      let res = null;
+      try { res = await loadImage(src, zip, entry.name); } catch (e) { console.warn("Bild:", src, e); }
+      if (!res) { bad++; continue; }
+      const self = el === a;
+      let w = px(el.style.width, aw) || parseFloat(el.getAttribute("width")) || (self ? 0 : 0);
+      let h = px(el.style.height, ah) || parseFloat(el.getAttribute("height")) || 0;
+      if (!w && !h) { w = aw; h = ah; }
+      if (!w && !h) { w = res.w; h = res.h; }
+      else if (!w) w = h * res.w / res.h;
+      else if (!h) h = w * res.h / res.w;
+      const ox = self ? 0 : (parseFloat(el.style.left) || 0), oy = self ? 0 : (parseFloat(el.style.top) || 0);
+      const im = document.createElementNS(NS, "image");
+      im.setAttribute("x", ox); im.setAttribute("y", oy);
+      im.setAttribute("width", w); im.setAttribute("height", h);
+      im.setAttribute("preserveAspectRatio", "none");
+      im.setAttribute("href", res.uri);
+      im.setAttributeNS(XLINK, "xlink:href", res.uri);
+      if (el.style.opacity) im.setAttribute("opacity", el.style.opacity);
+      const em = !self && (el.style.transform.match(/matrix\(([^)]+)\)/) || [])[1];
+      if (em) im.setAttribute("transform", `translate(${ox + w/2} ${oy + h/2}) matrix(${em}) translate(${-(ox + w/2)} ${-(oy + h/2)})`);
+      g.appendChild(im); used = true; nImg++;
+    }
+
+    // Handschrift
+    const ink = a.querySelector && a.querySelector("svg.ink");
+    if (ink) {
+      const s = document.importNode(ink, true);
+      s.querySelectorAll(".inkHitTestOverlay").forEach(o => o.remove());
+      s.removeAttribute("class"); s.removeAttribute("tabindex");
+      s.setAttribute("overflow", "visible");
+      g.appendChild(s); used = true; n++;
+    }
+    if (used) layer.appendChild(g);
+  }
+  if (!n && !nImg) { root.remove(); throw new Error("Keine Handschrift oder Bilder im Whiteboard gefunden."); }
+  const note = (nImg ? ` · ${nImg} Bild${nImg > 1 ? "er" : ""}` : "") + (bad ? ` · ${bad} nicht gefunden` : "");
 
   const b = layer.getBBox(), pad = 40;
   root.remove();
@@ -182,7 +295,7 @@ async function convert(f, status, miss = []) {
       document.body.appendChild(root);
       await Promise.race([pdf.svg(root, { x: 0, y: 0, width: W, height: H }), new Promise((_, no) => setTimeout(() => no(new Error("Zeitüberschreitung")), 90000))]);
       root.remove();
-      return { blob: pdf.output("blob"), info: "Vektor" };
+      return { blob: pdf.output("blob"), info: "Vektor" + note };
     } catch (e) {
       root.remove(); console.warn(e);
       status("Vektor fehlgeschlagen, nutze Bild …");
@@ -205,7 +318,7 @@ async function convert(f, status, miss = []) {
 
   const pdf = mk();
   pdf.addImage(c.toDataURL("image/png"), "PNG", 0, 0, W, H, undefined, "FAST");
-  return { blob: pdf.output("blob"), info: `Bild ${cw}×${ch} px` };
+  return { blob: pdf.output("blob"), info: `Bild ${cw}×${ch} px` + note };
 }
 </script>
 </body>
