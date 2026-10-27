@@ -194,6 +194,44 @@ function px(v, base) {
   return String(v).trim().endsWith("%") ? (base ? n / 100 * base : 0) : n;
 }
 
+function originOf(str, w, h) {
+  const t = (str || "50% 50%").trim().split(/\s+/);
+  let a = t[0], b = t[1];
+  if (a === "top" || a === "bottom") [a, b] = [b, a];
+  const f = (v, size) => {
+    if (v === undefined || v === "center") return size / 2;
+    if (v === "left" || v === "top") return 0;
+    if (v === "right" || v === "bottom") return size;
+    return v.endsWith("%") ? parseFloat(v) / 100 * size : (parseFloat(v) || 0);
+  };
+  return [f(a, w), f(b, h)];
+}
+// SVG-Transform eines HTML-Elements: Position (left/top), dann CSS-transform um transform-origin
+function tfOf(e, w, h) {
+  const x = parseFloat(e.style.left) || 0, y = parseFloat(e.style.top) || 0;
+  let s = (x || y) ? `translate(${x} ${y})` : "";
+  const t = e.style.transform;
+  if (t && t !== "none") {
+    try {
+      const M = new DOMMatrix(t), [ox, oy] = originOf(e.style.transformOrigin, w, h);
+      s += ` translate(${ox} ${oy}) matrix(${M.a} ${M.b} ${M.c} ${M.d} ${M.e} ${M.f}) translate(${-ox} ${-oy})`;
+    } catch (err) { console.warn("transform:", t, err); }
+  }
+  return s;
+}
+// alle Elemente vom Anchor (außen) bis zum Bild (innen) verketten
+function chainTf(el, w, h) {
+  const chain = [];
+  for (let e = el; e && e.nodeType === 1 && !/^(BODY|HTML)$/.test(e.tagName); e = e.parentElement) {
+    chain.unshift(e);
+    if (e.classList.contains("anchor")) break;
+  }
+  return chain.map(e => {
+    const ew = e === el ? w : (parseFloat(e.style.width) || w), eh = e === el ? h : (parseFloat(e.style.height) || h);
+    return tfOf(e, ew, eh);
+  }).join(" ");
+}
+
 async function convert(f, status, miss = []) {
   status("ZIP wird entpackt …");
   const zip = await JSZip.loadAsync(f);
@@ -213,12 +251,6 @@ async function convert(f, status, miss = []) {
     const isImg = a.tagName === "IMG";
     if (isImg && a.closest(".anchor")) continue; // wird über den Anchor erfasst
 
-    const x = parseFloat(a.style.left) || 0, y = parseFloat(a.style.top) || 0;
-    const m = (a.style.transform.match(/matrix\(([^)]+)\)/) || [])[1];
-    const g = document.createElementNS(NS, "g");
-    g.setAttribute("transform", `translate(${x} ${y})` + (m ? ` matrix(${m})` : ""));
-    let used = false;
-
     // Bilder (zuerst, damit Handschrift darüber liegt)
     const aw = px(a.style.width, 0) || parseFloat(a.getAttribute("width")) || 0;
     const ah = px(a.style.height, 0) || parseFloat(a.getAttribute("height")) || 0;
@@ -234,36 +266,38 @@ async function convert(f, status, miss = []) {
       let res = null;
       try { res = await loadImage(src, zip, entry.name); } catch (e) { console.warn("Bild:", src, e); }
       if (!res) { bad++; continue; }
-      const self = el === a;
-      let w = px(el.style.width, aw) || parseFloat(el.getAttribute("width")) || (self ? 0 : 0);
+      let w = px(el.style.width, aw) || parseFloat(el.getAttribute("width")) || 0;
       let h = px(el.style.height, ah) || parseFloat(el.getAttribute("height")) || 0;
       if (!w && !h) { w = aw; h = ah; }
       if (!w && !h) { w = res.w; h = res.h; }
       else if (!w) w = h * res.w / res.h;
       else if (!h) h = w * res.h / res.w;
-      const ox = self ? 0 : (parseFloat(el.style.left) || 0), oy = self ? 0 : (parseFloat(el.style.top) || 0);
+      const g = document.createElementNS(NS, "g");
+      const t = chainTf(el, w, h);
+      if (t) g.setAttribute("transform", t);
       const im = document.createElementNS(NS, "image");
-      im.setAttribute("x", ox); im.setAttribute("y", oy);
+      im.setAttribute("x", 0); im.setAttribute("y", 0);
       im.setAttribute("width", w); im.setAttribute("height", h);
       im.setAttribute("preserveAspectRatio", "none");
       im.setAttribute("href", res.uri);
       im.setAttributeNS(XLINK, "xlink:href", res.uri);
       if (el.style.opacity) im.setAttribute("opacity", el.style.opacity);
-      const em = !self && (el.style.transform.match(/matrix\(([^)]+)\)/) || [])[1];
-      if (em) im.setAttribute("transform", `translate(${ox + w/2} ${oy + h/2}) matrix(${em}) translate(${-(ox + w/2)} ${-(oy + h/2)})`);
-      g.appendChild(im); used = true; nImg++;
+      g.appendChild(im); layer.appendChild(g); nImg++;
     }
 
-    // Handschrift
-    const ink = a.querySelector && a.querySelector("svg.ink");
+    // Handschrift (unverändert)
+    const ink = a.querySelector("svg.ink");
     if (ink) {
+      const x = parseFloat(a.style.left) || 0, y = parseFloat(a.style.top) || 0;
+      const m = (a.style.transform.match(/matrix\(([^)]+)\)/) || [])[1];
+      const g = document.createElementNS(NS, "g");
+      g.setAttribute("transform", `translate(${x} ${y})` + (m ? ` matrix(${m})` : ""));
       const s = document.importNode(ink, true);
       s.querySelectorAll(".inkHitTestOverlay").forEach(o => o.remove());
       s.removeAttribute("class"); s.removeAttribute("tabindex");
       s.setAttribute("overflow", "visible");
-      g.appendChild(s); used = true; n++;
+      g.appendChild(s); layer.appendChild(g); n++;
     }
-    if (used) layer.appendChild(g);
   }
   if (!n && !nImg) { root.remove(); throw new Error("Keine Handschrift oder Bilder im Whiteboard gefunden."); }
   const note = (nImg ? ` · ${nImg} Bild${nImg > 1 ? "er" : ""}` : "") + (bad ? ` · ${bad} nicht gefunden` : "");
