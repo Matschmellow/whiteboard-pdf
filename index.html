@@ -119,6 +119,23 @@ async function handle(files) {
       a.href = URL.createObjectURL(r.blob);
       a.download = f.name.replace(/\.zip$/i, "") + ".pdf";
       item.appendChild(a);
+      if (r.dbg && r.dbg.includes("--- Bild")) {
+        const d = document.createElement("a");
+        d.href = "#"; d.textContent = "Debug-Info"; d.style.cssText = "font-size:.85rem;color:var(--mut)";
+        d.onclick = ev => {
+          ev.preventDefault();
+          let ta = item.parentNode.querySelector("textarea[data-for='" + f.name + "']");
+          if (!ta) {
+            ta = document.createElement("textarea");
+            ta.dataset.for = f.name; ta.readOnly = true; ta.value = r.dbg;
+            ta.style.cssText = "width:100%;height:200px;font:12px monospace;margin-top:8px;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:8px";
+            item.after(ta);
+          }
+          ta.select();
+          try { navigator.clipboard.writeText(r.dbg); } catch (e) {}
+        };
+        wrap.appendChild(d);
+      }
     } catch (e) {
       info.className = "err";
       info.textContent = "Fehler: " + e.message;
@@ -247,6 +264,8 @@ async function convert(f, status, miss = []) {
   document.body.appendChild(root);
 
   let n = 0, nImg = 0, bad = 0;
+  const dbg = [];
+  const css = [...doc.querySelectorAll('style')].map(x => x.textContent).join('\n').slice(0, 4000);
   for (const a of doc.querySelectorAll(".anchor, img")) {
     const isImg = a.tagName === "IMG";
     if (isImg && a.closest(".anchor")) continue; // wird über den Anchor erfasst
@@ -283,6 +302,12 @@ async function convert(f, status, miss = []) {
       im.setAttributeNS(XLINK, "xlink:href", res.uri);
       if (el.style.opacity) im.setAttribute("opacity", el.style.opacity);
       g.appendChild(im); layer.appendChild(g); nImg++;
+      if (dbg.length < 4) {
+        const c = (a.cloneNode ? a : el).cloneNode(true);
+        c.querySelectorAll && c.querySelectorAll("svg.ink").forEach(o => o.remove());
+        const html = c.outerHTML.replace(/(src|href)="([^"]{60})[^"]*"/g, '$1="$2…"').replace(/url\((['"]?)(data:[^)]{20})[^)]*\)/g, "url($1$2…)").slice(0, 1500);
+        dbg.push(`--- Bild ${nImg} (${w}x${h}, natürlich ${res.w}x${res.h}) ---\nSVG-transform: ${t}\n${html}`);
+      }
     }
 
     // Handschrift (unverändert)
@@ -329,7 +354,7 @@ async function convert(f, status, miss = []) {
       document.body.appendChild(root);
       await Promise.race([pdf.svg(root, { x: 0, y: 0, width: W, height: H }), new Promise((_, no) => setTimeout(() => no(new Error("Zeitüberschreitung")), 90000))]);
       root.remove();
-      return { blob: pdf.output("blob"), info: "Vektor" + note };
+      return { blob: pdf.output("blob"), info: "Vektor" + note, dbg: dbg.join("\n\n") + "\n\n--- CSS ---\n" + css };
     } catch (e) {
       root.remove(); console.warn(e);
       status("Vektor fehlgeschlagen, nutze Bild …");
@@ -352,7 +377,7 @@ async function convert(f, status, miss = []) {
 
   const pdf = mk();
   pdf.addImage(c.toDataURL("image/png"), "PNG", 0, 0, W, H, undefined, "FAST");
-  return { blob: pdf.output("blob"), info: `Bild ${cw}×${ch} px` + note };
+  return { blob: pdf.output("blob"), info: `Bild ${cw}×${ch} px` + note, dbg: dbg.join("\n\n") + "\n\n--- CSS ---\n" + css };
 }
 </script>
 </body>
