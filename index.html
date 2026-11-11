@@ -180,11 +180,43 @@ async function loadImage(src, zip, basePath) {
   return { uri: jpeg ? c.toDataURL("image/jpeg", 0.92) : c.toDataURL("image/png"), w, h };
 }
 
-function getMatrixTransform(el) {
-  const st = window.getComputedStyle(el);
-  const t = st.transform;
-  if (!t || t === "none") return "";
-  return t;
+// Ermittelt Position (Mittelpunkt), lineare Transformation (Skalierung/Rotation
+// aller Vorfahren) und kumulierte Deckkraft. Styles immer über das Fenster des
+// iframes lesen, sonst liefert z. B. Safari leere Werte.
+function place(el, view) {
+  const r = el.getBoundingClientRect();
+  let m = new DOMMatrix(), op = 1;
+  for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+    const cs = view.getComputedStyle(n);
+    const o = parseFloat(cs.opacity);
+    if (!isNaN(o)) op *= o;
+    if (cs.transform && cs.transform !== "none") {
+      try {
+        const q = new DOMMatrix(cs.transform);
+        q.e = 0; q.f = 0;            // Verschiebung steckt schon in r
+        m = q.multiply(m);
+      } catch (e) {}
+    }
+  }
+  return { r, m, op };
+}
+
+function makeGroup(p, ow, oh, boardRect) {
+  const cx = p.r.left + p.r.width / 2 - boardRect.left;
+  const cy = p.r.top + p.r.height / 2 - boardRect.top;
+  const { a, b, c, d } = p.m;
+  const g = document.createElementNS(NS, "g");
+  g.setAttribute("transform", `translate(${cx} ${cy}) matrix(${a} ${b} ${c} ${d} 0 0) translate(${-ow / 2} ${-oh / 2})`);
+  if (p.op < 1) g.setAttribute("opacity", p.op);
+  return g;
+}
+
+function invertColor(v) {
+  return v
+    .replace(/rgba?\(\s*235\s*,\s*235\s*,\s*235/gi, m => m.replace(/235/g, "25"))
+    .replace(/rgba?\(\s*31\s*,\s*31\s*,\s*31/gi, m => m.replace(/31/g, "255"))
+    .replace(/#ebebeb\b/gi, "#191919")
+    .replace(/#1f1f1f\b/gi, "#ffffff");
 }
 
 async function convert(f, status, miss = []) {
@@ -192,7 +224,7 @@ async function convert(f, status, miss = []) {
   const zip = await JSZip.loadAsync(f);
   const entry = Object.values(zip.files).find(z => !z.dir && /\.html?$/i.test(z.name));
   if (!entry) throw new Error("Keine HTML-Datei in der ZIP gefunden.");
-  
+
   const rawHtml = await entry.async("string");
 
   // Unsichtbares Iframe für originalgetreue CSS-Berechnungen nutzen
@@ -201,15 +233,12 @@ async function convert(f, status, miss = []) {
   iframe.style.cssText = "position:absolute;left:-99999px;top:0;width:4000px;height:4000px;border:0;visibility:hidden;";
   document.body.appendChild(iframe);
 
-  const idoc = iframe.contentWindow.document;
+  const view = iframe.contentWindow;
+  const idoc = view.document;
   idoc.open();
   idoc.write(rawHtml);
   idoc.close();
 
-  // Warten auf Stylesheets & DOM
-  await new Promise(r => setTimeout(r, 100));
-
-  status("Elemente werden erfasst …");
   const root = document.createElementNS(NS, "svg");
   root.setAttribute("style", "position:absolute;left:-99999px;top:0;width:10px;height:10px");
   const layer = document.createElementNS(NS, "g");
@@ -218,83 +247,116 @@ async function convert(f, status, miss = []) {
 
   let n = 0, nImg = 0;
 
-  // Bestimme Board-Referenzkoordinate (Fallback auf body)
-  const boardEl = idoc.querySelector(".board, .whiteboard, #board, #whiteboard, main") || idoc.body;
-  const boardRect = boardEl.getBoundingClientRect();
-
-  // 1. Bilder erfassen
-  const imgs = idoc.querySelectorAll("img, [style*='background-image']");
-  for (const el of imgs) {
-    let src = el.tagName === "IMG" ? (el.getAttribute("src") || el.getAttribute("data-src")) : null;
-    if (!src) {
-      const bg = el.style.backgroundImage || window.getComputedStyle(el).backgroundImage;
-      const m = bg ? bg.match(/url\((['"]?)(.*?)\1\)/) : null;
-      if (m) src = m[2];
+  try {
+    // Externe Stylesheets aus dem ZIP inline einbinden
+    for (const l of [...idoc.querySelectorAll('link[rel~="stylesheet"]')]) {
+      const e = findEntry(zip, entry.name, l.getAttribute("href") || "");
+      if (e) {
+        const st = idoc.createElement("style");
+        st.textContent = await e.async("string");
+        l.replaceWith(st);
+      }
     }
-    if (!src) continue;
+    await new Promise(r => setTimeout(r, 150));
 
-    let res = null;
-    try { res = await loadImage(src, zip, entry.name); } catch(e) {}
-    if (!res) continue;
+    status("Elemente werden erfasst …");
 
-    const r = el.getBoundingClientRect();
-    const x = r.left - boardRect.left;
-    const y = r.top - boardRect.top;
-    const w = r.width || res.w;
-    const h = r.height || res.h;
-
-    const g = document.createElementNS(NS, "g");
-    const im = document.createElementNS(NS, "image");
-    im.setAttribute("x", x);
-    im.setAttribute("y", y);
-    im.setAttribute("width", w);
-    im.setAttribute("height", h);
-    im.setAttribute("preserveAspectRatio", "none");
-    im.setAttribute("href", res.uri);
-    im.setAttributeNS(XLINK, "xlink:href", res.uri);
-
-    const op = window.getComputedStyle(el).opacity;
-    if (op && +op < 1) im.setAttribute("opacity", op);
-
-    g.appendChild(im);
-    layer.appendChild(g);
-    nImg++;
-  }
-
-  // 2. Vektorstriche (Handschrift/Ink) erfassen
-  const inks = idoc.querySelectorAll(".anchor, svg.ink");
-  for (const a of inks) {
-    const isInkDirect = a.tagName.toLowerCase() === "svg";
-    const ink = isInkDirect ? a : a.querySelector("svg.ink");
-    if (!ink) continue;
-
-    const r = (isInkDirect ? ink : a).getBoundingClientRect();
-    const x = r.left - boardRect.left;
-    const y = r.top - boardRect.top;
-
-    const g = document.createElementNS(NS, "g");
-    
-    // Berechne eventuelle Skalierung/Transformation
-    const tf = getMatrixTransform(isInkDirect ? ink : a);
-    if (tf && tf !== "none") {
-      g.setAttribute("transform", `translate(${x} ${y}) ${tf}`);
-    } else {
-      g.setAttribute("transform", `translate(${x} ${y})`);
+    // 1. Bilder VOR dem Messen laden und als src setzen (sonst Größe 0 im Layout)
+    const items = [...idoc.querySelectorAll("img, [style*='background-image'], svg.ink")];
+    const loaded = new Map();
+    for (const el of items) {
+      if (el.matches("svg.ink")) continue;
+      let src = el.tagName === "IMG" ? (el.getAttribute("src") || el.getAttribute("data-src")) : null;
+      if (!src) {
+        const bg = el.style.backgroundImage || view.getComputedStyle(el).backgroundImage;
+        const m = bg ? bg.match(/url\((['"]?)(.*?)\1\)/) : null;
+        if (m) src = m[2];
+      }
+      if (!src) continue;
+      let res = null;
+      try { res = await loadImage(src, zip, entry.name); } catch (e) {}
+      if (!res) continue;
+      loaded.set(el, res);
+      if (el.tagName === "IMG") {
+        el.removeAttribute("srcset");
+        el.src = res.uri;
+        try { await el.decode(); } catch (e) {}
+      }
     }
 
-    const s = document.importNode(ink, true);
-    s.querySelectorAll(".inkHitTestOverlay").forEach(o => o.remove());
-    s.removeAttribute("class");
-    s.removeAttribute("tabindex");
-    s.removeAttribute("style");
-    s.setAttribute("overflow", "visible");
+    const boardEl = idoc.querySelector(".board, .whiteboard, #board, #whiteboard, main") || idoc.body;
+    const boardRect = boardEl.getBoundingClientRect();
 
-    g.appendChild(s);
-    layer.appendChild(g);
-    n++;
+    // 2. Alles in Dokumentreihenfolge (Z-Reihenfolge bleibt erhalten)
+    for (const el of items) {
+      if (el.matches("svg.ink")) {
+        // Vektorstriche (Handschrift/Ink)
+        const p = place(el, view);
+        const vb = el.viewBox && el.viewBox.baseVal;
+        const ow = el.clientWidth || (vb && vb.width) || p.r.width;
+        const oh = el.clientHeight || (vb && vb.height) || p.r.height;
+        if (!ow || !oh) continue;
+
+        const s = document.importNode(el, true);
+
+        // Farben/Strichstärke festschreiben, bevor Klassen/Styles wegfallen
+        const srcNodes = el.querySelectorAll("*"), dstNodes = s.querySelectorAll("*");
+        srcNodes.forEach((o, i) => {
+          const t = dstNodes[i];
+          if (!t) return;
+          const cs = view.getComputedStyle(o);
+          if (!t.hasAttribute("fill") && cs.fill) t.setAttribute("fill", cs.fill);
+          if (!t.hasAttribute("stroke") && cs.stroke && cs.stroke !== "none") {
+            t.setAttribute("stroke", cs.stroke);
+            t.setAttribute("stroke-width", cs.strokeWidth);
+            t.setAttribute("stroke-linecap", cs.strokeLinecap);
+            t.setAttribute("stroke-linejoin", cs.strokeLinejoin);
+          }
+        });
+
+        s.querySelectorAll(".inkHitTestOverlay").forEach(o => o.remove());
+        s.removeAttribute("class");
+        s.removeAttribute("tabindex");
+        s.removeAttribute("style");
+        s.removeAttribute("x");
+        s.removeAttribute("y");
+        s.setAttribute("width", ow);
+        s.setAttribute("height", oh);
+        if (!s.getAttribute("viewBox")) s.setAttribute("viewBox", `0 0 ${ow} ${oh}`);
+        s.setAttribute("overflow", "visible");
+
+        const g = makeGroup(p, ow, oh, boardRect);
+        g.appendChild(s);
+        layer.appendChild(g);
+        n++;
+      } else {
+        const res = loaded.get(el);
+        if (!res) continue;
+        const p = place(el, view);
+        const ow = el.offsetWidth || res.w;
+        const oh = el.offsetHeight || res.h;
+        if (!ow || !oh) continue;
+
+        const g = makeGroup(p, ow, oh, boardRect);
+        const im = document.createElementNS(NS, "image");
+        im.setAttribute("x", 0);
+        im.setAttribute("y", 0);
+        im.setAttribute("width", ow);
+        im.setAttribute("height", oh);
+        im.setAttribute("preserveAspectRatio", "none");
+        im.setAttribute("href", res.uri);
+        im.setAttributeNS(XLINK, "xlink:href", res.uri);
+        g.appendChild(im);
+        layer.appendChild(g);
+        nImg++;
+      }
+    }
+  } catch (e) {
+    root.remove();
+    throw e;
+  } finally {
+    iframe.remove();
   }
-
-  iframe.remove();
 
   if (!n && !nImg) {
     root.remove();
@@ -314,6 +376,15 @@ async function convert(f, status, miss = []) {
   root.setAttribute("height", H);
   root.removeAttribute("style");
 
+  if (light) {
+    root.querySelectorAll("[fill],[stroke]").forEach(e => {
+      ["fill", "stroke"].forEach(attr => {
+        const v = e.getAttribute(attr);
+        if (v) e.setAttribute(attr, invertColor(v));
+      });
+    });
+  }
+
   const rect = document.createElementNS(NS, "rect");
   rect.setAttribute("x", b.x - pad);
   rect.setAttribute("y", b.y - pad);
@@ -321,18 +392,6 @@ async function convert(f, status, miss = []) {
   rect.setAttribute("height", H);
   rect.setAttribute("fill", light ? "#ffffff" : "#1f1f1f");
   root.insertBefore(rect, layer);
-
-  if (light) {
-    root.querySelectorAll("[fill]").forEach(e => {
-      const fl = e.getAttribute("fill");
-      if (fl) {
-        e.setAttribute("fill", fl
-          .replace(/rgba\(235,\s*235,\s*235,/, "rgba(25,25,25,")
-          .replace(/rgba\(31,\s*31,\s*31,/, "rgba(255,255,255,")
-        );
-      }
-    });
-  }
 
   const note = (nImg ? ` · ${nImg} Bild${nImg > 1 ? "er" : ""}` : "");
   const { jsPDF } = window.jspdf;
@@ -349,9 +408,11 @@ async function convert(f, status, miss = []) {
         new Promise((_, no) => setTimeout(() => no(new Error("Zeitüberschreitung")), 90000))
       ]);
       root.remove();
+      root.removeAttribute("style");
       return { blob: pdf.output("blob"), info: "Vektor" + note };
     } catch (e) {
       root.remove();
+      root.removeAttribute("style");
       console.warn("Vektor-Export fehlgeschlagen, wechsle auf Rasterung:", e);
       status("Vektor fehlgeschlagen, nutze Bild …");
     }
